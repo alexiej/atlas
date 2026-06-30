@@ -353,6 +353,19 @@ body {
   transition: opacity .15s, transform .1s;
 }
 .rp-play:hover { opacity: .88; transform: translateY(-1px); }
+.rp-download {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; padding: 10px; border-radius: 10px; margin-top: 8px;
+  font-weight: 600; font-size: 13px; letter-spacing: .03em;
+  color: var(--text-2); text-decoration: none;
+  border: 1px solid var(--border); background: var(--tag-bg);
+  transition: border-color .15s, color .15s, background .15s;
+}
+.rp-download:hover {
+  border-color: var(--border-h);
+  color: var(--text);
+  background: var(--card-h);
+}
 .rp-play-dis {
   display: flex; align-items: center; justify-content: center; gap: 10px;
   width: 100%; padding: 14px; border-radius: 10px;

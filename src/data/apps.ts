@@ -19,9 +19,10 @@ export interface AppData {
   status: AppStatus;
   size:   AppSize;
   desc:   string;
-  cover?: string;
-  url?:   string;
-  tags:   string[];
+  cover?:    string;
+  url?:      string;
+  download?: string;  // URL to .zip for offline download
+  tags:      string[];
   meta?:  AppMeta;
 }
 
@@ -89,8 +90,9 @@ export const APPS: AppData[] = [
     status:'ready',
     size:  'large',
     desc:  'Classic browser arcade game. Pilot your ship, blast rocks into smaller pieces, survive endless waves. Pure HTML + Canvas, no install.',
-    cover: '/atlas/screenshots/asteroids.jpg',
-    url:   '/atlas/apps/asteroids/index.html',
+    cover:    '/atlas/screenshots/asteroids.jpg',
+    url:      '/atlas/apps/asteroids/index.html',
+    download: '/atlas/apps/asteroids/asteroids.zip',
     tags:  ['game', 'canvas', 'arcade', 'browser'],
     meta: {
       source: 'Claude Cowork',
