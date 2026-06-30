@@ -6,8 +6,8 @@ export default defineConfig({
   output: 'static',            // generates flat HTML/CSS/JS — required for GitHub Pages
   integrations: [
     react(),
-    tailwind({ applyBaseStyles: false }), // globals.css handles @tailwind directives
+    tailwind(),  // handles @tailwind directives; globals.css adds custom styles on top
   ],
   site: 'https://alexiej.github.io',
-  base: '/ATLAS',
+  base: '/atlas',
 });
