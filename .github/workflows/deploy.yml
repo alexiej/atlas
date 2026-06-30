@@ -1,0 +1,70 @@
+name: Deploy ATLAS to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required for GitHub Pages OIDC deploy (no PAT needed)
+permissions:
+  contents:      read
+  pages:         write
+  id-token:      write
+
+# Only one deploy at a time; cancel in-flight if new push comes in
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── JOB 1: type-check + build ─────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm            # caches ~/.npm between runs
+
+      - name: Install dependencies
+        run: npm ci             # clean install from package-lock.json
+
+      - name: Type check
+        run: npx tsc --noEmit --skipLibCheck
+
+      - name: Build Astro site
+        run: npm run build
+        # astro.config.mjs → site: 'https://alexiej.github.io', base: '/atlas'
+        # Output: dist/   (all paths prefixed with /atlas/)
+
+      # Upload dist/ as a GitHub Pages artifact (preserved between jobs)
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  # ── JOB 2: deploy ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: build                # runs only if build succeeds
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}   # shown in GitHub UI
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+        # Picks up the artifact uploaded in the build job and pushes it to
+        # the GitHub Pages CDN — no branch, no gh-pages, no PAT required.
+        # Result: https://alexiej.github.io/atlas

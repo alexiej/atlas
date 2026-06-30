@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASTEROIDS — ATLAS</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: 'Press Start 2P', monospace;
+  }
+  canvas {
+    display: block;
+    position: fixed;
+    inset: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.07) 2px, rgba(0,0,0,0.07) 4px
+    );
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+const CFG = {
+  FPS: 60,
+  SHIP_SIZE: 18,
+  SHIP_THRUST: 0.22,
+  SHIP_FRICTION: 0.985,
+  SHIP_ROT_SPD: 0.055,
+  SHIP_INVINCIBLE_FRAMES: 180,
+  BULLET_SPD: 9,
+  BULLET_TTL: 55,
+  MAX_BULLETS: 5,
+  SHOOT_COOLDOWN: 8,
+  ASTEROID_SIZES: [
+    { r: 48, pts: 20,  spd: 1.0, verts: 11 },
+    { r: 26, pts: 50,  spd: 1.8, verts: 8  },
+    { r: 13, pts: 100, spd: 2.8, verts: 6  },
+  ],
+  INIT_ASTEROIDS: 5,
+  EXTRA_LIFE_SCORE: 10000,
+  COLORS: {
+    ship:     '#ffffff',
+    thrust:   '#ff8833',
+    bullet:   '#ffffff',
+    asteroid: '#ffffff',
+    particle: '#aaddff',
+    hud:      '#ffffff',
+    hudDim:   'rgba(255,255,255,0.45)',
+    danger:   '#ff4466',
+  }
+};
+
+// ─── CANVAS — fills entire viewport ──────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W = 0, H = 0;
+
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', () => { resize(); });
+
+// ─── DETECT EMBED ─────────────────────────────────────────────────────────────
+// If loaded inside an iframe, start in BACKGROUND mode (no ship, no title screen)
+const IS_EMBED = window !== window.parent;
+
+// ─── AUDIO ───────────────────────────────────────────────────────────────────
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+
+function playTone(freq, type, dur, vol = 0.12, decay = true) {
+  if (AC.state === 'suspended') return;
+  const osc  = AC.createOscillator();
+  const gain = AC.createGain();
+  osc.connect(gain);
+  gain.connect(AC.destination);
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, AC.currentTime);
+  if (decay) osc.frequency.exponentialRampToValueAtTime(freq * 0.1, AC.currentTime + dur);
+  gain.gain.setValueAtTime(vol, AC.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  osc.start(AC.currentTime);
+  osc.stop(AC.currentTime + dur);
+}
+
+function sndShoot()     { playTone(880,'square',0.08,0.1,false); playTone(440,'square',0.08,0.04,false); }
+function sndThrust()    { playTone(80,'sawtooth',0.1,0.04); }
+function sndExpLarge()  { playTone(100,'sawtooth',0.5,0.18); }
+function sndExpMed()    { playTone(180,'sawtooth',0.3,0.13); }
+function sndExpSmall()  { playTone(380,'sawtooth',0.15,0.09); }
+function sndExtraLife() {
+  [523,659,784,1047].forEach((f,i) => {
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.type='square'; o.frequency.value=f;
+    g.gain.setValueAtTime(0.12, AC.currentTime+i*0.1);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime+i*0.1+0.08);
+    o.start(AC.currentTime+i*0.1);
+    o.stop(AC.currentTime+i*0.1+0.1);
+  });
+}
+
+// ─── INPUT ───────────────────────────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── UTILS ───────────────────────────────────────────────────────────────────
+const rand  = (lo, hi) => Math.random() * (hi - lo) + lo;
+const randi = (lo, hi) => Math.floor(rand(lo, hi + 1));
+const wrap  = (v, max) => ((v % max) + max) % max;
+
+function circlesTouch(ax, ay, ar, bx, by, br) {
+  const dx = ax - bx, dy = ay - by;
+  return dx*dx + dy*dy < (ar + br) * (ar + br);
+}
+function safeSpawn(x, y) {
+  return !circlesTouch(x, y, CFG.ASTEROID_SIZES[0].r*2, W/2, H/2, 130);
+}
+
+// ─── PARTICLES ───────────────────────────────────────────────────────────────
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    const a = rand(0, Math.PI*2), s = rand(1.5, 5);
+    this.vx = Math.cos(a)*s; this.vy = Math.sin(a)*s;
+    this.life = randi(25, 55); this.maxLife = this.life;
+    this.color = color; this.size = rand(1.5, 3.5);
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vx *= 0.97; this.vy *= 0.97;
+    this.life--;
+  }
+  draw() {
+    const a = this.life / this.maxLife;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size*a, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+  get dead() { return this.life <= 0; }
+}
+
+// ─── ASTEROID ────────────────────────────────────────────────────────────────
+class Asteroid {
+  constructor(x, y, level = 0) {
+    this.level = level;
+    const def = CFG.ASTEROID_SIZES[level];
+    this.r = def.r * rand(0.85, 1.15);
+    this.pts = def.pts;
+    const angle = rand(0, Math.PI*2), spd = rand(def.spd*0.7, def.spd*1.3);
+    this.vx = Math.cos(angle)*spd; this.vy = Math.sin(angle)*spd;
+    this.x = x ?? (Math.random() < 0.5 ? rand(0, W*0.3) : rand(W*0.7, W));
+    this.y = y ?? rand(0, H);
+    this.rot = rand(0, Math.PI*2);
+    this.rotSpd = rand(-0.012, 0.012);
+    const n = def.verts;
+    this.verts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i/n)*Math.PI*2, noise = rand(0.65, 1.0);
+      this.verts.push({ x: Math.cos(a)*this.r*noise, y: Math.sin(a)*this.r*noise });
+    }
+  }
+  update() {
+    this.x = wrap(this.x + this.vx, W);
+    this.y = wrap(this.y + this.vy, H);
+    this.rot += this.rotSpd;
+  }
+  draw() {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.rot);
+    ctx.strokeStyle = CFG.COLORS.asteroid;
+    ctx.lineWidth = 1.5;
+    ctx.shadowColor = 'rgba(255,255,255,0.4)';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    this.verts.forEach((v, i) => i === 0 ? ctx.moveTo(v.x, v.y) : ctx.lineTo(v.x, v.y));
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+  split() {
+    const children = [];
+    if (this.level < 2) {
+      for (let i = 0; i < 2; i++) {
+        children.push(new Asteroid(this.x+rand(-15,15), this.y+rand(-15,15), this.level+1));
+      }
+    }
+    return children;
+  }
+}
+
+// ─── BULLET ──────────────────────────────────────────────────────────────────
+class Bullet {
+  constructor(x, y, angle) {
+    this.x = x; this.y = y;
+    this.vx = Math.cos(angle)*CFG.BULLET_SPD;
+    this.vy = Math.sin(angle)*CFG.BULLET_SPD;
+    this.life = CFG.BULLET_TTL; this.trail = [];
+  }
+  update() {
+    this.trail.push({ x: this.x, y: this.y });
+    if (this.trail.length > 6) this.trail.shift();
+    this.x = wrap(this.x + this.vx, W);
+    this.y = wrap(this.y + this.vy, H);
+    this.life--;
+  }
+  draw() {
+    this.trail.forEach((p, i) => {
+      ctx.globalAlpha = (i/this.trail.length)*0.35;
+      ctx.fillStyle = CFG.COLORS.bullet;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 1.5, 0, Math.PI*2); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = CFG.COLORS.bullet;
+    ctx.shadowColor = 'rgba(255,255,255,0.6)';
+    ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(this.x, this.y, 2.5, 0, Math.PI*2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  get dead() { return this.life <= 0; }
+}
+
+// ─── SHIP ────────────────────────────────────────────────────────────────────
+class Ship {
+  constructor() { this.reset(); }
+  reset() {
+    this.x = W/2; this.y = H/2;
+    this.vx = 0; this.vy = 0;
+    this.angle = -Math.PI/2;
+    this.thrusting = false;
+    this.invincible = CFG.SHIP_INVINCIBLE_FRAMES;
+    this.blinkTimer = 0;
+  }
+  update() {
+    if (keys['ArrowLeft']  || keys['KeyA']) this.angle -= CFG.SHIP_ROT_SPD;
+    if (keys['ArrowRight'] || keys['KeyD']) this.angle += CFG.SHIP_ROT_SPD;
+    this.thrusting = !!(keys['ArrowUp'] || keys['KeyW']);
+    if (this.thrusting) {
+      this.vx += Math.cos(this.angle)*CFG.SHIP_THRUST;
+      this.vy += Math.sin(this.angle)*CFG.SHIP_THRUST;
+      sndThrust();
+    }
+    this.vx *= CFG.SHIP_FRICTION; this.vy *= CFG.SHIP_FRICTION;
+    this.x = wrap(this.x + this.vx, W);
+    this.y = wrap(this.y + this.vy, H);
+    if (this.invincible > 0) { this.invincible--; this.blinkTimer++; }
+  }
+  get visible() { return this.invincible === 0 || Math.floor(this.blinkTimer/6)%2 === 0; }
+  draw() {
+    if (!this.visible) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle);
+    const S = CFG.SHIP_SIZE;
+    if (this.thrusting) {
+      ctx.strokeStyle = CFG.COLORS.thrust;
+      ctx.shadowColor = CFG.COLORS.thrust;
+      ctx.shadowBlur = 14;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(-S*0.6, -S*0.35);
+      ctx.lineTo(-S*(1.1 + Math.random()*0.5), 0);
+      ctx.lineTo(-S*0.6, S*0.35);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+    ctx.strokeStyle = CFG.COLORS.ship;
+    ctx.shadowColor = 'rgba(255,255,255,0.5)';
+    ctx.shadowBlur = 12;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.moveTo(S, 0);
+    ctx.lineTo(-S*0.6, -S*0.5);
+    ctx.lineTo(-S*0.35, 0);
+    ctx.lineTo(-S*0.6, S*0.5);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+  get hitR() { return CFG.SHIP_SIZE*0.6; }
+}
+
+// ─── STARS ───────────────────────────────────────────────────────────────────
+let STARS = [];
+function buildStars() {
+  STARS = Array.from({ length: 120 }, () => ({
+    x: rand(0, W), y: rand(0, H),
+    r: rand(0.3, 1.4), a: rand(0.08, 0.45),
+  }));
+}
+buildStars();
+window.addEventListener('resize', buildStars);
+
+function drawStars() {
+  STARS.forEach(s => {
+    ctx.fillStyle = `rgba(220,230,255,${s.a})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
+  });
+}
+
+// ─── HUD ─────────────────────────────────────────────────────────────────────
+function drawText(text, x, y, size, color = CFG.COLORS.hud, align = 'left') {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.font = `${size}px 'Press Start 2P', monospace`;
+  ctx.textAlign = align;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 6;
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+function drawHUD(score, lives, wave, hiScore) {
+  drawText(`${score}`, 20, 34, 14, CFG.COLORS.hud);
+  drawText('HI', W/2, 22, 8, CFG.COLORS.hudDim, 'center');
+  drawText(`${hiScore}`, W/2, 38, 12, CFG.COLORS.hud, 'center');
+  drawText(`WAVE ${wave}`, W - 20, 34, 10, CFG.COLORS.hudDim, 'right');
+  for (let i = 0; i < lives; i++) {
+    const sx = 20 + i*22, sy = 56;
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(-Math.PI/2);
+    ctx.strokeStyle = CFG.COLORS.ship;
+    ctx.shadowColor = 'rgba(255,255,255,0.4)';
+    ctx.shadowBlur = 6;
+    ctx.lineWidth = 1.5;
+    const s = 8;
+    ctx.beginPath();
+    ctx.moveTo(s,0); ctx.lineTo(-s*0.6,-s*0.5);
+    ctx.lineTo(-s*0.35,0); ctx.lineTo(-s*0.6,s*0.5);
+    ctx.closePath(); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ─── GAME STATE ──────────────────────────────────────────────────────────────
+const STATE = { BACKGROUND: 0, TITLE: 1, PLAYING: 2, DYING: 3, GAMEOVER: 4 };
+
+class Game {
+  constructor() {
+    this.hiScore = parseInt(localStorage.getItem('atlas_asteroids_hi') || '0');
+    this.state = IS_EMBED ? STATE.BACKGROUND : STATE.TITLE;
+    this._resetData();
+    this._spawnBgAsteroids();
+  }
+
+  _resetData() {
+    this.score = 0; this.lives = 3; this.wave = 0;
+    this.ship = new Ship();
+    this.asteroids = []; this.bullets = []; this.particles = [];
+    this.shootTimer = 0; this.dyingTimer = 0;
+    this.nextLifeAt = CFG.EXTRA_LIFE_SCORE;
+  }
+
+  _spawnBgAsteroids() {
+    // fill screen with drifting asteroids (for background + title screens)
+    const count = Math.ceil((W * H) / 80000) + 4;
+    for (let i = 0; i < count; i++) {
+      this.asteroids.push(new Asteroid(rand(0,W), rand(0,H), randi(0,1)));
+    }
+  }
+
+  startGame() {
+    this._resetData();
+    this.ship.x = W/2; this.ship.y = H/2;
+    this._spawnWave();
+    this.state = STATE.PLAYING;
+    AC.resume();
+  }
+
+  _spawnWave() {
+    this.wave++;
+    this.asteroids = [];
+    const count = CFG.INIT_ASTEROIDS + this.wave - 1;
+    for (let i = 0; i < count; i++) {
+      let x, y;
+      do { x = rand(0, W); y = rand(0, H); } while (!safeSpawn(x, y));
+      this.asteroids.push(new Asteroid(x, y, 0));
+    }
+  }
+
+  explode(x, y, count, color) {
+    for (let i = 0; i < count; i++) this.particles.push(new Particle(x, y, color));
+  }
+
+  addScore(pts) {
+    this.score += pts;
+    if (this.score >= this.nextLifeAt) {
+      this.lives++; this.nextLifeAt += CFG.EXTRA_LIFE_SCORE; sndExtraLife();
+    }
+    if (this.score > this.hiScore) {
+      this.hiScore = this.score;
+      localStorage.setItem('atlas_asteroids_hi', this.hiScore);
+    }
+  }
+
+  update() {
+    // BACKGROUND — just drift asteroids, wait for postMessage
+    if (this.state === STATE.BACKGROUND) {
+      this.asteroids.forEach(a => a.update());
+      return;
+    }
+
+    // TITLE
+    if (this.state === STATE.TITLE) {
+      this.asteroids.forEach(a => a.update());
+      if (keys['Enter'] || keys['Space']) this.startGame();
+      return;
+    }
+
+    // GAMEOVER
+    if (this.state === STATE.GAMEOVER) {
+      this.asteroids.forEach(a => a.update());
+      if (keys['Enter'] || keys['Space']) this.startGame();
+      return;
+    }
+
+    // DYING
+    if (this.state === STATE.DYING) {
+      this.dyingTimer--;
+      this.particles.forEach(p => p.update());
+      this.particles = this.particles.filter(p => !p.dead);
+      this.asteroids.forEach(a => a.update());
+      if (this.dyingTimer <= 0) {
+        if (this.lives <= 0) {
+          this.state = STATE.GAMEOVER;
+          if (!this.asteroids.length) this._spawnBgAsteroids();
+        } else {
+          this.ship.reset(); this.ship.x = W/2; this.ship.y = H/2;
+          this.state = STATE.PLAYING;
+        }
+      }
+      return;
+    }
+
+    // PLAYING
+    this.ship.update();
+
+    if (this.shootTimer > 0) this.shootTimer--;
+    if ((keys['Space'] || keys['KeyZ']) && this.shootTimer === 0 && this.bullets.length < CFG.MAX_BULLETS) {
+      const S = CFG.SHIP_SIZE;
+      this.bullets.push(new Bullet(
+        this.ship.x + Math.cos(this.ship.angle)*S,
+        this.ship.y + Math.sin(this.ship.angle)*S,
+        this.ship.angle
+      ));
+      this.shootTimer = CFG.SHOOT_COOLDOWN;
+      sndShoot();
+    }
+
+    this.bullets.forEach(b => b.update());
+    this.bullets = this.bullets.filter(b => !b.dead);
+    this.asteroids.forEach(a => a.update());
+    this.particles.forEach(p => p.update());
+    this.particles = this.particles.filter(p => !p.dead);
+
+    // bullets vs asteroids
+    const deadAsteroids = new Set(), deadBullets = new Set();
+    for (let bi = 0; bi < this.bullets.length; bi++) {
+      const b = this.bullets[bi];
+      for (let ai = 0; ai < this.asteroids.length; ai++) {
+        const a = this.asteroids[ai];
+        if (circlesTouch(b.x, b.y, 3, a.x, a.y, a.r)) {
+          deadBullets.add(bi); deadAsteroids.add(ai);
+        }
+      }
+    }
+    const newAsteroids = [];
+    deadAsteroids.forEach(ai => {
+      const a = this.asteroids[ai];
+      this.addScore(a.pts);
+      this.explode(a.x, a.y, a.level===0?18:a.level===1?12:7, CFG.COLORS.particle);
+      if (a.level===0) sndExpLarge(); else if (a.level===1) sndExpMed(); else sndExpSmall();
+      newAsteroids.push(...a.split());
+    });
+    this.bullets    = this.bullets.filter((_,i) => !deadBullets.has(i));
+    this.asteroids  = this.asteroids.filter((_,i) => !deadAsteroids.has(i));
+    this.asteroids.push(...newAsteroids);
+
+    // ship vs asteroids
+    if (this.ship.invincible === 0) {
+      for (const a of this.asteroids) {
+        if (circlesTouch(this.ship.x, this.ship.y, this.ship.hitR, a.x, a.y, a.r*0.85)) {
+          this.lives--;
+          this.explode(this.ship.x, this.ship.y, 30, CFG.COLORS.ship);
+          this.explode(this.ship.x, this.ship.y, 15, CFG.COLORS.thrust);
+          this.bullets = [];
+          this.state = STATE.DYING; this.dyingTimer = 100;
+          if (a.level===0) sndExpLarge();
+          break;
+        }
+      }
+    }
+
+    if (this.asteroids.length === 0) this._spawnWave();
+  }
+
+  draw() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    drawStars();
+
+    this.particles.forEach(p => p.draw());
+    this.asteroids.forEach(a => a.draw());
+
+    ctx.save();
+    this.bullets.forEach(b => b.draw());
+    ctx.restore();
+    ctx.globalAlpha = 1;
+
+    if (this.state === STATE.PLAYING || this.state === STATE.DYING) {
+      this.ship.draw();
+      drawHUD(this.score, this.lives, this.wave, this.hiScore);
+    }
+
+    if (this.state === STATE.TITLE)    this._drawTitle();
+    if (this.state === STATE.GAMEOVER) this._drawGameOver();
+    // BACKGROUND: no overlay drawn here — parent page handles it
+  }
+
+  _drawTitle() {
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, W, H);
+
+    drawText('ASTEROIDS', W/2, H/2 - 70, 28, '#ffffff', 'center');
+    drawText('BLAST ROCKS! 95', W/2, H/2 - 34, 9, 'rgba(255,255,255,0.4)', 'center');
+
+    if (Math.floor(Date.now()/600)%2)
+      drawText('PRESS ENTER TO START', W/2, H/2 + 12, 10, '#ffffff', 'center');
+
+    drawText('↑W THRUST   ←→AD ROTATE   SPACE FIRE', W/2, H/2 + 60, 7, 'rgba(255,255,255,0.35)', 'center');
+    drawText(`HI-SCORE  ${this.hiScore}`, W/2, H/2 + 90, 8, 'rgba(255,255,255,0.55)', 'center');
+    drawText('ATLAS TOOLS', W/2, H - 20, 6, 'rgba(255,255,255,0.18)', 'center');
+  }
+
+  _drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+
+    drawText('GAME OVER', W/2, H/2 - 45, 24, '#ffffff', 'center');
+    drawText(`SCORE  ${this.score}`, W/2, H/2 + 14, 12, '#ffffff', 'center');
+    drawText(`HI     ${this.hiScore}`, W/2, H/2 + 38, 12, 'rgba(255,255,255,0.5)', 'center');
+
+    if (Math.floor(Date.now()/600)%2)
+      drawText('PRESS ENTER TO RETRY', W/2, H/2 + 75, 9, '#ffffff', 'center');
+  }
+}
+
+// ─── INIT & LOOP ─────────────────────────────────────────────────────────────
+const game = new Game();
+
+window.addEventListener('message', e => {
+  if (e.data === 'atlas:start') game.startGame();
+});
+
+// standalone: also start on click
+if (!IS_EMBED) {
+  canvas.addEventListener('click', () => {
+    if (game.state === STATE.TITLE || game.state === STATE.GAMEOVER) game.startGame();
+  });
+}
+
+document.addEventListener('click', () => AC.resume(), { once: true });
+
+let last = 0;
+function loop(ts) {
+  const dt = ts - last;
+  if (dt >= 1000 / CFG.FPS) { last = ts; game.update(); game.draw(); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
